@@ -1,112 +1,150 @@
-# CC LINE Ollama
+# cc-line-ollama
 
-LINE Bot ที่ใช้ **Claude Code CLI** + **Ollama** (local LLM) — รัน AI agent บนเครื่องตัวเอง ฟรี 100%
+LINE Messaging API bridge for Claude Code with Ollama (local LLM). Chat with a local AI coding agent through LINE — no API key needed.
 
 ## Architecture
 
 ```
-LINE app → Cloudflare Tunnel → line-bot (Bun + Claude Code CLI) → Ollama Proxy → Ollama (host, port 11434)
+LINE → Cloudflare Tunnel → line-bot (Bun) → server (Claude Agent SDK) → Ollama (Docker) → qwen3:8b
 ```
 
-2 Docker services:
-- **line-bot** — Bun HTTP server + Claude Code CLI + Ollama proxy (strips `?beta=true`)
-- **cloudflared** — Cloudflare tunnel for HTTPS
+4 containers:
+- **ollama** — Local LLM inference engine (Docker)
+- **server** — Claude Code API server (Hono + Claude Agent SDK)
+- **line-bot** — LINE webhook handler (Bun + @line/bot-sdk)
+- **cloudflared** — Cloudflare tunnel to expose webhook
 
-Claude Code CLI ใช้ Ollama เป็น backend โดย:
-1. Bot สร้าง proxy (port 11435) ที่ strip query params ที่ Ollama ไม่รองรับ
-2. ตั้ง `ANTHROPIC_AUTH_TOKEN=ollama` + `ANTHROPIC_BASE_URL=http://localhost:11435`
-3. Claude Code CLI spawn subprocess แล้วส่ง prompt ไปยัง Ollama ผ่าน proxy
-
-## Prerequisites
-
-- **Ollama ต้องรันบนเครื่อง host** (ไม่ได้อยู่ใน Docker Compose)
-
-```bash
-# Install Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Pull model
-ollama pull qwen3:8b
-```
+The bot can work with any compatible server by changing `SERVER_URL`.
 
 ## Setup
 
-1. สร้าง LINE Messaging API channel ที่ https://developers.line.biz/console/
+1. Create a LINE Messaging API channel at https://developers.line.biz/console/
+2. In the channel settings:
+   - Enable "Use webhook"
+   - Issue a "Channel access token (long-lived)"
+   - Note the "Channel secret"
+3. Copy and edit `.env`:
 
-2. ตั้งค่า environment:
 ```bash
 cp .env.example .env
-# แก้ไข .env:
-# - LINE_CHANNEL_ACCESS_TOKEN=your-token
-# - LINE_CHANNEL_SECRET=your-secret
-# - CLOUDFLARE_TUNNEL_TOKEN=your-tunnel-token
+# Edit .env with your credentials (no Anthropic API key needed)
 ```
 
-3. Deploy:
+## Usage
+
 ```bash
+# Start all containers
 docker compose up -d --build
+
+# Pull model (required on first run)
+docker exec cc-ollama-engine ollama pull qwen3:8b
+
+# Get the tunnel URL
+docker logs cc-ollama-tunnel 2>&1 | grep -o 'https://[^ ]*'
 ```
 
-4. ดู tunnel URL แล้วตั้งใน LINE Developer Console:
+Set the webhook URL in LINE Developer Console: `https://<tunnel-url>/webhook`
+
+Check server health:
 ```bash
-docker logs cc-ollama-tunnel
-# Set webhook URL: https://your-tunnel.trycloudflare.com/webhook
+docker exec cc-ollama-line-bot curl -s http://server:4096/health
 ```
 
-## Changing Models
+## Model Switching
 
 ```bash
-# Pull model ใหม่บน host
-ollama pull llama3.1:8b
+# Pull a different model
+docker exec cc-ollama-engine ollama pull llama3.1:8b
 
-# แก้ .env
+# Update .env
 CLAUDE_MODEL=llama3.1:8b
 
-# Restart bot
-docker compose up -d --build
+# Restart server
+docker compose up -d server
 ```
 
-Popular models:
-- `qwen3:8b` (default) — fast, good quality
-- `llama3.1:8b` — general purpose
-- `deepseek-coder-v2:16b` — strong coding
-- `codellama:13b` — coding focused
+Popular models for coding:
+- `qwen3:8b` (default) — good balance of speed and quality
+- `llama3.1:8b` — Meta's general-purpose model
+- `deepseek-coder-v2:16b` — specialized for code
+- `codellama:13b` — Meta's code-specific model
+
+## GPU Support
+
+Uncomment the GPU section in `docker-compose.yml` for NVIDIA GPU acceleration:
+
+```yaml
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+```
+
+Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/).
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `/new` | เริ่ม session ใหม่ |
-| `/abort` | ยกเลิก prompt ที่กำลังทำ |
-| `/sessions` | ดูสถานะ session |
-| `/about` (`/who`) | แนะนำตัว bot |
-| `/help` (`/คำสั่ง`) | คำสั่งทั้งหมด |
-
-## Docker Commands
-
-```bash
-# Build and deploy
-docker compose up -d --build
-
-# Logs
-docker logs cc-ollama-line-bot --tail 30     # LINE bot + Claude Code
-docker logs cc-ollama-tunnel                 # Tunnel URL
-```
+- Send any text message to start coding
+- `/new` - Start a new coding session
+- `/abort` - Cancel the current prompt
+- `/sessions` - Show active session info
+- `/cost` - Show total cost for current session
 
 ## How it works
+
+Each LINE user gets their own Claude Code session. Messages are forwarded to the server API via HTTP, which runs Claude Code Agent SDK pointing at the Ollama container.
 
 ```
 User (LINE app)
   ↕  LINE Messaging API webhook
-cc-line-ollama (Bun HTTP server, port 3000)
-  ↕  spawn("claude", ["-p", prompt, "--model", "qwen3:8b", ...])
-Claude Code CLI
-  ↕  ANTHROPIC_BASE_URL=http://localhost:11435 (proxy)
-Ollama Proxy (port 11435, strips ?beta=true)
-  ↕
-Ollama (host, port 11434)
+line-bot (Bun, port 3000)
+  ↕  HTTP fetch → http://server:4096
+server (Hono + Claude Agent SDK, port 4096)
+  ↕  query() → Claude Code CLI (bundled in SDK)
+  ↕  ANTHROPIC_BASE_URL → http://ollama:11434
+ollama (port 11434) → qwen3:8b
 ```
 
-## Forked from
+## Environment Variables
 
-[claude-code-line](https://github.com/monthop-gmail/claude-code-line) — แยก Ollama mode ออกมาเป็น repo เฉพาะ
+### Bot
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `LINE_CHANNEL_ACCESS_TOKEN` | Yes | - | LINE channel access token |
+| `LINE_CHANNEL_SECRET` | Yes | - | LINE channel secret |
+| `SERVER_URL` | No | `http://server:4096` | Server API URL |
+| `SERVER_PASSWORD` | No | - | Server auth password |
+| `PROMPT_TIMEOUT_MS` | No | `300000` | Timeout per prompt (5 min) |
+
+### Server
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `API_PASSWORD` | No | - | API auth password |
+| `CLAUDE_MODEL` | No | `qwen3:8b` | Ollama model to use |
+| `CLAUDE_MAX_TURNS` | No | `10` | Max agentic turns per prompt |
+| `CLAUDE_MAX_BUDGET_USD` | No | `1.00` | Max spend per prompt |
+
+### Docker
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `CLOUDFLARE_TUNNEL_TOKEN` | Yes | - | Cloudflare tunnel token |
+| `PROJECT_DIR` | No | `./workspace` | Project directory to mount |
+
+## Docker Commands
+
+```bash
+# Logs
+docker logs cc-ollama-engine --tail 30       # Ollama
+docker logs cc-ollama-server --tail 30       # Server
+docker logs cc-ollama-line-bot --tail 30     # Bot
+docker logs cc-ollama-tunnel                 # Tunnel
+
+# List models
+docker exec cc-ollama-engine ollama list
+
+# Stop
+docker compose down
+```

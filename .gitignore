@@ -1,4 +1,6 @@
 .env
 node_modules
-workspace/*
-!workspace/AGENTS.md
+workspace/
+server/node_modules
+bun.lock*
+server/bun.lock*

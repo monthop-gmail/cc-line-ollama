@@ -5,190 +5,60 @@ import { createHmac } from "node:crypto"
 const channelAccessToken = process.env.LINE_CHANNEL_ACCESS_TOKEN
 const channelSecret = process.env.LINE_CHANNEL_SECRET
 const port = Number(process.env.PORT ?? 3000)
-const ollamaUrl = process.env.OLLAMA_URL ?? "http://host.docker.internal:11434"
-const claudeModel = process.env.CLAUDE_MODEL ?? "qwen3:8b"
-const claudeMaxTurns = process.env.CLAUDE_MAX_TURNS ?? "10"
-const claudeMaxBudget = process.env.CLAUDE_MAX_BUDGET_USD ?? "1.00"
-const claudeTimeoutMs = Number(process.env.CLAUDE_TIMEOUT_MS ?? 300_000)
-const workspaceDir = process.env.WORKSPACE_DIR ?? "/workspace"
+const serverUrl = process.env.SERVER_URL ?? "http://server:4096"
+const serverPassword = process.env.SERVER_PASSWORD
+const timeoutMs = Number(process.env.PROMPT_TIMEOUT_MS ?? 300_000)
 
 if (!channelAccessToken || !channelSecret) {
   console.error("Missing LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET")
   process.exit(1)
 }
 
-console.log("CC Ollama LINE bot configuration:")
-console.log("- Channel access token present:", !!channelAccessToken)
-console.log("- Channel secret present:", !!channelSecret)
-console.log("- Ollama URL:", ollamaUrl)
-console.log("- Model:", claudeModel)
-console.log("- Max turns:", claudeMaxTurns)
-console.log("- Max budget:", `$${claudeMaxBudget}`)
-console.log("- Timeout:", `${claudeTimeoutMs}ms`)
-console.log("- Workspace:", workspaceDir)
-
-// --- Ollama Proxy (strip ?beta=true that Claude Code adds) ---
-const proxyPort = 11435
-
-Bun.serve({
-  port: proxyPort,
-  async fetch(req) {
-    const url = new URL(req.url)
-    const pathname = url.pathname
-
-    // Fake count_tokens endpoint (Ollama doesn't support it)
-    if (pathname.endsWith("/count_tokens")) {
-      const body = await req.json().catch(() => ({})) as any
-      return Response.json({ input_tokens: body?.messages?.length ? 1000 : 0 })
-    }
-
-    // Strip query params (Claude Code adds ?beta=true which Ollama doesn't support)
-    const targetUrl = `${ollamaUrl}${pathname}`
-    const headers = new Headers()
-    for (const [k, v] of req.headers.entries()) {
-      if (k !== "host") headers.set(k, v)
-    }
-    const res = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-      body: req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
-      // @ts-ignore - Bun supports duplex
-      duplex: "half",
-    })
-    const respHeaders = new Headers()
-    for (const [k, v] of res.headers.entries()) {
-      respHeaders.set(k, v)
-    }
-    return new Response(res.body, { status: res.status, headers: respHeaders })
-  },
-})
-console.log(`Ollama proxy listening on http://localhost:${proxyPort} -> ${ollamaUrl}`)
+console.log("Claude Code LINE bot configuration:")
+console.log("- Server URL:", serverUrl)
+console.log("- Server auth:", serverPassword ? "enabled" : "disabled")
+console.log("- Timeout:", `${timeoutMs}ms`)
 
 // --- LINE Client ---
 const lineClient = new messagingApi.MessagingApiClient({ channelAccessToken })
 
-// --- Session & Process Management ---
+// --- Server HTTP Client ---
+const serverAuth = serverPassword ? `Bearer ${serverPassword}` : ""
+
+async function serverRequest(
+  method: string,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<any> {
+  const headers: Record<string, string> = {}
+  if (serverAuth) headers["Authorization"] = serverAuth
+  if (body !== undefined) headers["Content-Type"] = "application/json"
+
+  const resp = await fetch(`${serverUrl}${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: signal ?? AbortSignal.timeout(timeoutMs),
+  })
+
+  const text = await resp.text()
+  if (!resp.ok) throw new Error(`Server ${resp.status}: ${text.slice(0, 300)}`)
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
+}
+
+// --- Session Management ---
 interface UserSession {
-  sessionId: string | null
+  sessionId: string
   totalCost: number
 }
 
 const sessions = new Map<string, UserSession>()
-const activeProcesses = new Map<string, ReturnType<typeof Bun.spawn>>()
 const userQueues = new Map<string, Promise<void>>()
-
-// --- Claude Code subprocess runner ---
-async function runClaude(
-  userId: string,
-  prompt: string,
-  isRetry = false,
-): Promise<{ result: string; sessionId: string; cost: number; isError: boolean }> {
-  const session = sessions.get(userId)
-
-  const args = [
-    "-p",
-    prompt,
-    "--output-format",
-    "json",
-    "--max-turns",
-    claudeMaxTurns,
-    "--max-budget-usd",
-    claudeMaxBudget,
-    "--dangerously-skip-permissions",
-    "--model",
-    claudeModel,
-  ]
-
-  if (session?.sessionId) {
-    args.push("--resume", session.sessionId)
-  }
-
-  // Build clean environment — point Claude Code at Ollama via proxy
-  const env: Record<string, string> = {}
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined) env[k] = v
-  }
-  env.ANTHROPIC_AUTH_TOKEN = "ollama"
-  env.ANTHROPIC_BASE_URL = `http://localhost:${proxyPort}`
-  delete env.ANTHROPIC_API_KEY
-  delete env.CLAUDECODE
-
-  console.log(
-    `[${userId.slice(-8)}] Running claude ${session?.sessionId ? `--resume ${session.sessionId}` : "(new session)"}`,
-  )
-
-  const proc = Bun.spawn(["claude", ...args], {
-    cwd: workspaceDir,
-    env,
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-
-  activeProcesses.set(userId, proc)
-
-  const timeoutId = setTimeout(() => {
-    console.log(`[${userId.slice(-8)}] Timeout, killing process`)
-    proc.kill()
-  }, claudeTimeoutMs)
-
-  try {
-    const stdout = await new Response(proc.stdout).text()
-    const stderr = await new Response(proc.stderr).text()
-    await proc.exited
-
-    clearTimeout(timeoutId)
-    activeProcesses.delete(userId)
-
-    if (stderr) {
-      console.error(`[${userId.slice(-8)}] stderr:`, stderr.slice(0, 500))
-    }
-
-    // Parse JSON output
-    let parsed: any
-    try {
-      parsed = JSON.parse(stdout)
-    } catch {
-      // If resume failed, retry without --resume (once)
-      if (
-        !isRetry &&
-        session?.sessionId &&
-        (stdout.includes("No conversation found") ||
-          stdout.includes("not found"))
-      ) {
-        console.log(
-          `[${userId.slice(-8)}] Session expired, starting fresh`,
-        )
-        sessions.delete(userId)
-        return runClaude(userId, prompt, true)
-      }
-      return {
-        result: stdout || stderr || "Claude process returned no output",
-        sessionId: session?.sessionId ?? "",
-        cost: 0,
-        isError: true,
-      }
-    }
-
-    const newSessionId = parsed.session_id ?? session?.sessionId ?? ""
-    const cost = parsed.total_cost_usd ?? 0
-
-    sessions.set(userId, {
-      sessionId: newSessionId,
-      totalCost: (session?.totalCost ?? 0) + cost,
-    })
-
-    return {
-      result: parsed.result ?? "Done. (no text output)",
-      sessionId: newSessionId,
-      cost,
-      isError: parsed.is_error ?? false,
-    }
-  } catch (err: any) {
-    clearTimeout(timeoutId)
-    activeProcesses.delete(userId)
-    throw err
-  }
-}
 
 // --- Per-user request queue ---
 function enqueueForUser<T>(userId: string, fn: () => Promise<T>): Promise<T> {
@@ -266,6 +136,55 @@ async function sendMessage(userId: string, text: string): Promise<void> {
   }
 }
 
+// --- Send prompt to server ---
+async function sendPrompt(
+  userId: string,
+  prompt: string,
+): Promise<{ result: string; cost: number; isError: boolean }> {
+  const session = sessions.get(userId)
+
+  // Create session if needed
+  if (!session) {
+    const created = await serverRequest("POST", "/session")
+    sessions.set(userId, { sessionId: created.id, totalCost: 0 })
+    console.log(`[${userId.slice(-8)}] Created session: ${created.id}`)
+  }
+
+  const { sessionId } = sessions.get(userId)!
+
+  console.log(`[${userId.slice(-8)}] Sending prompt to session ${sessionId}`)
+
+  try {
+    const result = await serverRequest(
+      "POST",
+      `/session/${sessionId}/message`,
+      { prompt },
+    )
+
+    const cost = result.cost_usd ?? 0
+    const s = sessions.get(userId)!
+    s.totalCost += cost
+
+    return {
+      result: result.result ?? "Done. (no text output)",
+      cost,
+      isError: result.is_error ?? false,
+    }
+  } catch (err: any) {
+    // If session expired or not found, create fresh and retry
+    if (
+      err?.message?.includes("404") ||
+      err?.message?.includes("not found") ||
+      err?.message?.includes("No conversation")
+    ) {
+      console.log(`[${userId.slice(-8)}] Session expired, creating fresh`)
+      sessions.delete(userId)
+      return sendPrompt(userId, prompt)
+    }
+    throw err
+  }
+}
+
 // --- Handle incoming LINE message ---
 async function handleTextMessage(
   userId: string,
@@ -276,13 +195,19 @@ async function handleTextMessage(
 
   // --- Commands ---
   if (text.toLowerCase() === "/new") {
+    const session = sessions.get(userId)
+    if (session) {
+      await serverRequest("DELETE", `/session/${session.sessionId}`).catch(
+        () => {},
+      )
+    }
     sessions.delete(userId)
     await lineClient.replyMessage({
       replyToken,
       messages: [
         {
           type: "text",
-          text: "เริ่ม session ใหม่แล้วครับ ส่งข้อความมาได้เลย!",
+          text: "Session cleared. Next message starts a new session.",
         },
       ],
     })
@@ -290,29 +215,60 @@ async function handleTextMessage(
   }
 
   if (text.toLowerCase() === "/abort") {
-    const proc = activeProcesses.get(userId)
-    if (proc) {
-      proc.kill()
-      activeProcesses.delete(userId)
-      await lineClient.replyMessage({
-        replyToken,
-        messages: [{ type: "text", text: "ยกเลิกคำสั่งแล้วครับ" }],
-      })
-    } else {
-      await lineClient.replyMessage({
-        replyToken,
-        messages: [{ type: "text", text: "ไม่มี session ที่ใช้งานอยู่ครับ" }],
-      })
+    const session = sessions.get(userId)
+    if (session) {
+      const res = await serverRequest(
+        "POST",
+        `/session/${session.sessionId}/abort`,
+      ).catch(() => ({ aborted: false }))
+      if (res.aborted) {
+        await lineClient.replyMessage({
+          replyToken,
+          messages: [{ type: "text", text: "Prompt cancelled." }],
+        })
+        return
+      }
     }
+    await lineClient.replyMessage({
+      replyToken,
+      messages: [{ type: "text", text: "No active prompt." }],
+    })
     return
   }
 
   if (text.toLowerCase() === "/sessions") {
     const session = sessions.get(userId)
-    const isRunning = activeProcesses.has(userId)
-    const msg = session?.sessionId
-      ? `Session: ...${session.sessionId.slice(-8)}\nStatus: ${isRunning ? "กำลังทำงาน" : "ว่าง"}`
-      : "ยังไม่มี session ครับ ส่งข้อความมาเพื่อเริ่มใช้งาน!"
+    if (session) {
+      const info = await serverRequest(
+        "GET",
+        `/session/${session.sessionId}`,
+      ).catch(() => null)
+      const msg = info
+        ? `Session: ${session.sessionId}\nCost: $${session.totalCost.toFixed(4)}\nStatus: ${info.status}`
+        : `Session: ${session.sessionId}\nCost: $${session.totalCost.toFixed(4)}`
+      await lineClient.replyMessage({
+        replyToken,
+        messages: [{ type: "text", text: msg }],
+      })
+    } else {
+      await lineClient.replyMessage({
+        replyToken,
+        messages: [
+          {
+            type: "text",
+            text: "No active session. Send a message to start one.",
+          },
+        ],
+      })
+    }
+    return
+  }
+
+  if (text.toLowerCase() === "/cost") {
+    const session = sessions.get(userId)
+    const msg = session
+      ? `Total cost this session: $${session.totalCost.toFixed(4)}`
+      : "No active session."
     await lineClient.replyMessage({
       replyToken,
       messages: [{ type: "text", text: msg }],
@@ -320,60 +276,28 @@ async function handleTextMessage(
     return
   }
 
-  if (text.toLowerCase() === "/about" || text.toLowerCase() === "/who") {
-    const aboutMsg = `🧑‍💻 สวัสดีครับ! ผมคือ CC Ollama Bot
-
-🤖 Model: ${claudeModel} (local, ฟรี!)
-📱 ทำงานผ่าน Claude Code CLI + Ollama
-📦 GitHub: https://github.com/monthop-gmail/cc-line-ollama
-📖 พิมพ์ /help ดูคำสั่งทั้งหมด`
-    await lineClient.replyMessage({
-      replyToken,
-      messages: [{ type: "text", text: aboutMsg }],
-    })
-    return
-  }
-
-  if (text.toLowerCase() === "/help" || text.toLowerCase() === "/คำสั่ง") {
-    const helpMsg = `📖 คำสั่งทั้งหมด:
-
-🤖 ทั่วไป
-  /about — แนะนำตัว bot
-  /help — คำสั่งทั้งหมด
-
-💻 Session
-  /new — เริ่มบทสนทนาใหม่
-  /abort — ยกเลิกคำสั่งที่กำลังทำ
-  /sessions — ดูสถานะ session
-
-💬 วิธีใช้งาน:
-  พิมพ์ข้อความได้เลย! bot จะตอบผ่าน Claude Code CLI + Ollama`
-    await lineClient.replyMessage({
-      replyToken,
-      messages: [{ type: "text", text: helpMsg }],
-    })
-    return
-  }
-
   // --- Enqueue prompt ---
   enqueueForUser(userId, async () => {
     try {
-      const { result, isError } = await runClaude(userId, text)
+      const { result, cost, isError } = await sendPrompt(userId, text)
 
       let responseText = result
+      if (cost > 0) {
+        responseText += `\n\n[cost: $${cost.toFixed(4)}]`
+      }
       if (isError) {
         responseText = `Error: ${result}`
       }
 
       console.log(
-        `[${userId.slice(-8)}] Response: ${responseText.length} chars`,
+        `[${userId.slice(-8)}] Response: ${responseText.length} chars, cost: $${cost.toFixed(4)}`,
       )
       await sendMessage(userId, responseText)
     } catch (err: any) {
-      console.error("Claude prompt error:", err?.message)
+      console.error("Prompt error:", err?.message)
       await sendMessage(
         userId,
-        `เกิดข้อผิดพลาดครับ: ${err?.message?.slice(0, 200) ?? "ไม่ทราบสาเหตุ"}`,
+        `Error: ${err?.message?.slice(0, 200) ?? "Unknown error"}`,
       )
     }
   })
@@ -386,7 +310,7 @@ Bun.serve({
     const url = new URL(req.url)
 
     if (req.method === "GET" && url.pathname === "/") {
-      return new Response("CC Ollama LINE Bot is running")
+      return new Response("Claude Code LINE Bot is running")
     }
 
     if (req.method === "POST" && url.pathname === "/webhook") {
@@ -429,5 +353,5 @@ Bun.serve({
 })
 
 console.log(
-  `CC Ollama LINE bot listening on http://localhost:${port}/webhook`,
+  `Claude Code LINE bot listening on http://localhost:${port}/webhook`,
 )

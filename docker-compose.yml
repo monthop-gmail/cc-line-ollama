@@ -1,23 +1,53 @@
 services:
-  # LINE bot + Claude Code CLI → Ollama
+  # Ollama engine - local LLM inference
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cc-ollama-engine
+    volumes:
+      - ollama-models:/root/.ollama
+    # Uncomment for NVIDIA GPU support:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
+  # Claude Code API server (Agent SDK → Ollama)
+  server:
+    build: ./server
+    container_name: cc-ollama-server
+    environment:
+      - ANTHROPIC_AUTH_TOKEN=ollama
+      - ANTHROPIC_BASE_URL=http://ollama:11434
+      - API_PASSWORD=${API_PASSWORD:-}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-qwen3:8b}
+      - CLAUDE_MAX_TURNS=${CLAUDE_MAX_TURNS:-10}
+      - CLAUDE_MAX_BUDGET_USD=${CLAUDE_MAX_BUDGET_USD:-1.00}
+      - PORT=4096
+      - WORKSPACE_DIR=/workspace
+    volumes:
+      - ${PROJECT_DIR:-./workspace}:/workspace
+      - claude-data:/home/claude/.claude
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  # LINE bot - bridges LINE messages to server
   line-bot:
     build: .
     container_name: cc-ollama-line-bot
     environment:
       - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
       - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
-      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - SERVER_URL=http://server:4096
+      - SERVER_PASSWORD=${API_PASSWORD:-}
+      - PROMPT_TIMEOUT_MS=${PROMPT_TIMEOUT_MS:-300000}
       - PORT=3000
-      - CLAUDE_MODEL=${CLAUDE_MODEL:-qwen3:8b}
-      - CLAUDE_MAX_TURNS=${CLAUDE_MAX_TURNS:-10}
-      - CLAUDE_MAX_BUDGET_USD=${CLAUDE_MAX_BUDGET_USD:-1.00}
-      - CLAUDE_TIMEOUT_MS=${CLAUDE_TIMEOUT_MS:-300000}
-      - WORKSPACE_DIR=/workspace
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ${PROJECT_DIR:-./workspace}:/workspace
-      - claude-data:/home/claude/.claude
+    depends_on:
+      - server
     restart: unless-stopped
 
   # Cloudflare tunnel - exposes LINE webhook to internet
@@ -30,4 +60,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  ollama-models:
   claude-data:
