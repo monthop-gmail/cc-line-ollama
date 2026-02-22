@@ -1,0 +1,33 @@
+services:
+  # LINE bot + Claude Code CLI → Ollama
+  line-bot:
+    build: .
+    container_name: cc-ollama-line-bot
+    environment:
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - PORT=3000
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-qwen3:8b}
+      - CLAUDE_MAX_TURNS=${CLAUDE_MAX_TURNS:-10}
+      - CLAUDE_MAX_BUDGET_USD=${CLAUDE_MAX_BUDGET_USD:-1.00}
+      - CLAUDE_TIMEOUT_MS=${CLAUDE_TIMEOUT_MS:-300000}
+      - WORKSPACE_DIR=/workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${PROJECT_DIR:-./workspace}:/workspace
+      - claude-data:/home/claude/.claude
+    restart: unless-stopped
+
+  # Cloudflare tunnel - exposes LINE webhook to internet
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cc-ollama-tunnel
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - line-bot
+    restart: unless-stopped
+
+volumes:
+  claude-data:
